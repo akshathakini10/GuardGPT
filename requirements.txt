@@ -1,0 +1,1 @@
+requests>=2.31.0 //it is used for HTTP requests(calling API's)
