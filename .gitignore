@@ -1,0 +1,15 @@
+# Ignore dataset and cache files
+cache/
+*.index
+harm_only_400k_dataset.json
+
+# Ignore virtual environments
+.venv/
+venv/
+
+# Ignore log files
+logs/
+*.jsonl
+
+# Ignore downloaded model binaries
+models/

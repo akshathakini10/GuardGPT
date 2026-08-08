@@ -1,186 +1,195 @@
-# ============================================================
-# GuardGPT - dataset_loader.py
-# ============================================================
-# PURPOSE:
-#   Load the harm dataset (JSON file) into memory once,
-#   build a TF-IDF search index over all records,
-#   and answer "which record best matches this prompt?" queries.
-#
-# HOW TF-IDF WORKS (simple explanation):
-#   - Rare words get HIGH weight  (e.g. "ransomware" → very significant)
-#   - Common words get LOW weight (e.g. "the" → filtered out as stopword)
-#   - When a prompt arrives, we find the dataset record that shares
-#     the most high-weight words with it.
-# ============================================================
-
-import json, math, re, time, logging
-from collections import defaultdict
+import json
+import logging
+import time
 from pathlib import Path
 from typing import Optional
 
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
 logger = logging.getLogger(__name__)
 
-# Path to the dataset file (must be in the Engine/ root folder)
-DATASET_PATH = Path(__file__).parent.parent / "harm_only_400k_dataset.json"
-
-# ── Stopwords ─────────────────────────────────────────────────────────────────
-# These common English words appear everywhere and carry NO safety signal.
-# Removing them dramatically improves matching accuracy.
-# Example: "fuck you" → after removing "you" → only "fuck" remains
-#          → correctly matches hate_speech records instead of any record with "you"
-_STOPWORDS = frozenset({
-    # Articles, prepositions, conjunctions
-    "the","a","an","and","or","but","in","on","at","to","for","of",
-    "with","by","from","into","about","up","out","than","then","there",
-    # Common verbs
-    "is","was","are","were","be","been","have","has","had",
-    "do","does","did","will","would","could","should","may","might",
-    "get","got","go","going","know","want","need","make","use",
-    "tell","give","show","see","look","come","take","help","said","say",
-    # Pronouns
-    "i","you","he","she","we","they","it","me","him","her","us","them",
-    "my","your","his","our","their","its","this","that","these","those",
-    # Common filler words
-    "what","which","who","how","when","where","why","if","as","so",
-    "not","no","can","just","now","also","more","please","am","very",
-    "some","any","all","one","two","new","good","other","like",
-})
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATASET_PATH = PROJECT_ROOT / "harm_only_400k_dataset.json"
+CACHE_DIR = PROJECT_ROOT / "cache"
+INDEX_PATH = CACHE_DIR / "guardgpt_faiss.index"
+RECORDS_PATH = CACHE_DIR / "guardgpt_records.json"
+MODEL_NAME = "all-MiniLM-L6-v2"
 
 
-def _tokenize(text: str) -> list[str]:
-    """
-    Convert any text into a list of clean, meaningful tokens.
-
-    Steps:
-      1. Lowercase everything
-      2. Remove punctuation (keep only letters, numbers, spaces)
-      3. Split into words
-      4. Remove short words (1 char) and stopwords
-
-    Example:
-      Input : "How do I hack into someone's account?"
-      Output: ["hack", "account"]
-    """
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)          # remove punctuation
-    tokens = [t for t in text.split() if len(t) > 1]  # remove 1-char words
-    return [t for t in tokens if t not in _STOPWORDS]  # remove stopwords
-
-
-# ── DatasetLoader class ───────────────────────────────────────────────────────
 class DatasetLoader:
-    """
-    Loads the harm dataset once and answers record-matching queries.
+    """Loads dataset and executes vector search via Sentence-BERT + FAISS."""
 
-    Usage:
-        loader = DatasetLoader()
-        loader.load()                    # loads dataset + builds index
-        record = loader.query(prompt)    # finds best matching record
-    """
-
-    def __init__(self, path: str | Path = DATASET_PATH) -> None:
-        self._path      = Path(path)
-        self._records   = []              # all dataset records in memory
-        self._index     = defaultdict(list)  # token → [record indices]
-        self._idf       = {}              # token → IDF weight
-        self._loaded    = False
+    def __init__(
+        self,
+        path: str | Path = DATASET_PATH,
+        model_name: str = MODEL_NAME,
+        max_records: Optional[int] = None,  # Full dataset indexing enabled
+    ) -> None:
+        self._path = Path(path)
+        self._model_name = model_name
+        self.max_records = max_records
+        self._records: list[dict] = []
+        self._texts: list[str] = []
+        self._model: Optional[SentenceTransformer] = None
+        self._index = None
+        self._loaded = False
         self._load_time = 0.0
 
     def load(self) -> None:
-        """
-        Load dataset from disk and build the TF-IDF index.
-        Calling this multiple times is safe — it only loads once.
-        """
         if self._loaded:
-            return  # already loaded, skip
+            return
+
+        start_time = time.monotonic()
 
         if not self._path.exists():
             raise FileNotFoundError(
                 f"Dataset not found: {self._path}\n"
-                "Place harm_only_400k_dataset.json in the Engine/ folder."
+                "Place harm_only_400k_dataset.json in the project root folder."
             )
 
-        logger.info("Loading dataset from %s ...", self._path)
-        t0 = time.monotonic()
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        logger.info("Loading Sentence-BERT model: %s", self._model_name)
+        self._model = SentenceTransformer(self._model_name)
 
-        with open(self._path, "r", encoding="utf-8") as f:
-            self._records = json.load(f)
+        if INDEX_PATH.exists() and RECORDS_PATH.exists():
+            try:
+                logger.info("Loading cached FAISS index...")
+                self._index = faiss.read_index(str(INDEX_PATH))
+                with open(RECORDS_PATH, "r", encoding="utf-8") as file:
+                    self._records = json.load(file)
 
-        logger.info("Loaded %d records. Building TF-IDF index ...", len(self._records))
-        self._build_index()
+                self._texts = [str(r.get("input_text", "")) for r in self._records]
 
-        self._load_time = time.monotonic() - t0
-        self._loaded = True
-        logger.info(
-            "Dataset ready in %.2fs | %d unique tokens indexed",
-            self._load_time, len(self._index)
+                if self._index.ntotal != len(self._records):
+                    raise ValueError("Cached FAISS index and records size mismatch.")
+
+                self._loaded = True
+                self._load_time = time.monotonic() - start_time
+                logger.info("Cached index loaded successfully (%d records).", len(self._records))
+                return
+            except Exception as error:
+                logger.warning("Could not use cached index: %s. Rebuilding...", error)
+
+        logger.info("Loading dataset from %s", self._path)
+        with open(self._path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        if isinstance(data, dict):
+            self._records = data.get("records", [])
+        elif isinstance(data, list):
+            self._records = data
+        else:
+            raise ValueError("Invalid dataset format.")
+
+        if not self._records:
+            raise ValueError("Dataset contains no records.")
+
+        if self.max_records is not None and len(self._records) > self.max_records:
+            logger.info("Limiting dataset to first %d records.", self.max_records)
+            self._records = self._records[: self.max_records]
+
+        self._texts = [str(r.get("input_text", "")) for r in self._records]
+        logger.info("Generating embeddings for %d records...", len(self._records))
+
+        embeddings = self._model.encode(
+            self._texts,
+            batch_size=64,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
         )
 
-    def query(self, text: str) -> Optional[dict]:
-        """
-        Find the dataset record that best matches the given prompt.
+        embeddings = np.asarray(embeddings, dtype="float32")
+        dimension = embeddings.shape[1]
 
-        How it works:
-          1. Tokenize the prompt (remove stopwords)
-          2. For each token, find all records that contain it
-          3. Score each record by summing IDF weights of shared tokens
-          4. Return the highest-scoring record
+        self._index = faiss.IndexFlatIP(dimension)
+        self._index.add(embeddings)
 
-        Returns None if no tokens match anything in the dataset.
-        """
+        try:
+            faiss.write_index(self._index, str(INDEX_PATH))
+            with open(RECORDS_PATH, "w", encoding="utf-8") as file:
+                json.dump(self._records, file, ensure_ascii=False)
+            logger.info("FAISS index saved to cache.")
+        except OSError as error:
+            logger.warning("Could not save cache: %s", error)
+
+        self._load_time = time.monotonic() - start_time
+        self._loaded = True
+
+    def query(self, text: str, top_k: int = 1) -> Optional[dict]:
         if not self._loaded:
             self.load()
+        if not text or not text.strip():
+            return None
 
-        tokens = _tokenize(text)
-        if not tokens:
-            return None  # nothing meaningful in the prompt
+        query_embedding = self._model.encode(
+            [text], convert_to_numpy=True, normalize_embeddings=True
+        )
+        query_embedding = np.asarray(query_embedding, dtype="float32")
 
-        # Score every record that shares at least one token with the prompt
-        scores = defaultdict(float)
-        for token in tokens:
-            if token not in self._index:
-                continue  # this word is not in the dataset at all
-            for record_idx in self._index[token]:
-                scores[record_idx] += self._idf.get(token, 0.0)
+        top_k = max(1, min(top_k, len(self._records)))
+        similarities, indices = self._index.search(query_embedding, top_k)
 
-        if not scores:
-            return None  # no matching records found
+        if indices.size == 0 or indices[0][0] < 0:
+            return None
 
-        # Return the record with the highest total score
-        best_idx = max(scores, key=lambda k: scores[k])
-        return self._records[best_idx]
+        best_index = int(indices[0][0])
+        best_score = float(similarities[0][0])
 
-    def _build_index(self) -> None:
-        """
-        Build the inverted index and compute IDF weights.
+        record = dict(self._records[best_index])
+        record["_similarity"] = round(best_score, 4)
+        return record
 
-        For each record:
-          - Tokenize its input_text
-          - Map each token → record index
-          - Count how many records contain each token (document frequency)
+    def query_top_k(self, text: str, top_k: int = 5) -> list[dict]:
+        if not self._loaded:
+            self.load()
+        if not text or not text.strip():
+            return []
 
-        Then compute IDF for each token:
-          IDF = log(total_records / records_containing_token) + 1
-          → rare tokens get high IDF, common tokens get low IDF
-        """
-        doc_freq = defaultdict(int)  # token → count of records containing it
-        n = len(self._records)
+        query_embedding = self._model.encode(
+            [text], convert_to_numpy=True, normalize_embeddings=True
+        )
+        query_embedding = np.asarray(query_embedding, dtype="float32")
+        top_k = max(1, min(top_k, len(self._records)))
+        similarities, indices = self._index.search(query_embedding, top_k)
 
-        for idx, record in enumerate(self._records):
-            # Use a SET so each token is counted once per record
-            tokens = set(_tokenize(record.get("input_text", "")))
-            for token in tokens:
-                self._index[token].append(idx)
-                doc_freq[token] += 1
+        results = []
+        for score, index in zip(similarities[0], indices[0]):
+            if index < 0:
+                continue
+            record = dict(self._records[int(index)])
+            record["_similarity"] = round(float(score), 4)
+            results.append(record)
 
-        # Compute smoothed IDF for every token
-        for token, df in doc_freq.items():
-            self._idf[token] = math.log(n / df) + 1.0
+        return results
 
-    # ── Read-only properties ──────────────────────────────────────────────────
+    def clear_cache(self) -> None:
+        for cache_file in (INDEX_PATH, RECORDS_PATH):
+            try:
+                if cache_file.exists():
+                    cache_file.unlink()
+            except OSError as error:
+                logger.warning("Could not delete %s: %s", cache_file, error)
+
+        self._index = None
+        self._records = []
+        self._texts = []
+        self._loaded = False
+
     @property
-    def is_loaded(self)    -> bool:  return self._loaded
+    def is_loaded(self) -> bool:
+        return self._loaded
+
     @property
-    def record_count(self) -> int:   return len(self._records)
+    def record_count(self) -> int:
+        return len(self._records)
+
     @property
-    def load_time(self)    -> float: return self._load_time
+    def load_time(self) -> float:
+        return self._load_time
+
+    @property
+    def embedding_dimension(self) -> int:
+        return 0 if self._index is None else self._index.d

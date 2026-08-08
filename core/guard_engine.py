@@ -2,315 +2,453 @@
 # GuardGPT - guard_engine.py
 # ============================================================
 # PURPOSE:
-#   The main orchestrator that connects all pipeline stages.
+#   Main controller for the GuardGPT security pipeline.
 #
-# FULL PIPELINE (in order):
-#   1. DatasetLoader     → loads 599k harm records into memory
-#   2. IntentClassifier  → Layer 1 (keywords) + Layer 2 (TF-IDF)
-#   3. ConversationGuard → checks conversation history context
-#   4. DecisionEngine    → final ALLOW / BLOCK + audit log
-#   5. LlamaBackend      → generates response (only if ALLOWED)
-#
-# CLI COMMANDS:
-#   /new    → clear conversation history
-#   /status → show dataset stats and Llama availability
-#   exit    → quit the program
+# PIPELINE:
+#   User Prompt -> IntentClassifier -> DatasetLoader (FAISS)
+#   -> ConversationGuard -> DecisionEngine -> ALLOW / BLOCK -> Llama
 # ============================================================
 
-import logging, uuid
+import logging
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
-from core.dataset_loader     import DatasetLoader
-from core.intent_classifier  import IntentClassifier
 from core.conversation_guard import ConversationGuard
-from core.decision_engine    import DecisionEngine, DecisionOutput
-from core.llama_backend      import LlamaBackend
+from core.dataset_loader import DatasetLoader
+from core.decision_engine import DecisionEngine, DecisionOutput
+from core.intent_classifier import GuardResult, IntentClassifier
+from core.llama_backend import LlamaBackend
 
 logger = logging.getLogger(__name__)
 
-# System prompt sent to Llama with every approved request.
-# This guides the LLM to behave responsibly.
+
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
+
 SYSTEM_PROMPT = (
     "You are GuardGPT, a helpful and responsible AI assistant. "
-    "Answer the user's question clearly and concisely. "
-    "Never produce harmful, unethical, or misleading content. "
-    "If a question touches on sensitive topics, respond carefully and empathetically."
+    "Answer the user's question clearly and accurately. "
+    "Do not provide harmful or unsafe instructions."
 )
 
-# ANSI colour codes for coloured terminal output
+
+# ============================================================
+# TERMINAL COLOURS
+# ============================================================
+
 _COLOURS = {
-    "safe"    : "\033[92m",   # green
-    "low"     : "\033[93m",   # yellow
-    "medium"  : "\033[33m",   # orange
-    "high"    : "\033[91m",   # red
-    "critical": "\033[1;91m", # bold red
+    "safe": "\033[92m",
+    "low": "\033[93m",
+    "medium": "\033[33m",
+    "high": "\033[91m",
+    "critical": "\033[1;91m",
 }
+
 _RESET = "\033[0m"
 
 
-# ── EngineResponse dataclass ──────────────────────────────────────────────────
+# ============================================================
+# ENGINE RESPONSE
+# ============================================================
+
 @dataclass
 class EngineResponse:
-    """
-    The complete result of processing one user prompt.
-    Contains everything needed to display the result in the CLI.
+    """Complete response returned by GuardEngine."""
 
-    Fields:
-      allowed         : True = prompt passed safety check
-      intent          : detected intent label
-      risk_level      : safe / low / medium / high / critical
-      decision        : full DecisionOutput from DecisionEngine
-      llama_response  : LLM's answer (None if blocked or Llama unavailable)
-      blocked_message : message shown to user when blocked
-      error           : error message if Llama failed
-    """
     allowed: bool
     intent: str
     risk_level: str
     decision: DecisionOutput
-    llama_response: Optional[str]  = None
+    llama_response: Optional[str] = None
     blocked_message: Optional[str] = None
-    error: Optional[str]           = None
+    error: Optional[str] = None
 
 
-# ── GuardEngine class ─────────────────────────────────────────────────────────
+# ============================================================
+# GUARD ENGINE
+# ============================================================
+
 class GuardEngine:
-    """
-    Top-level orchestrator. Runs the full safety pipeline for every prompt.
+    """Main GuardGPT controller."""
 
-    One instance per process. Dataset loads once on first use (lazy loading).
+    def __init__(
+        self,
+        session_id: Optional[str] = None,
+    ) -> None:
+        self.session_id = session_id or str(uuid.uuid4())
 
-    Usage:
-        engine = GuardEngine()
-        engine.run_interactive()   # starts the CLI
-        # OR
-        response = engine.process("tell me about AI")
-    """
+        self._loader = DatasetLoader()
+        self._classifier = IntentClassifier()
+        self._guard = ConversationGuard(self.session_id)
+        self._decision = DecisionEngine()
+        self._llama = LlamaBackend()
+        self._ready = False
 
-    def __init__(self, session_id: Optional[str] = None) -> None:
-        # Give this session a unique ID for tracking
-        self.session_id  = session_id or str(uuid.uuid4())
-
-        # Initialise all pipeline components
-        self._loader     = DatasetLoader()
-        self._classifier = IntentClassifier(self._loader)
-        self._guard      = ConversationGuard(self.session_id)
-        self._decision   = DecisionEngine()
-        self._llama      = LlamaBackend()
-        self._ready      = False  # becomes True after dataset loads
+        logger.info("GuardEngine created | session=%s", self.session_id)
 
     def startup(self) -> None:
-        """
-        Load the dataset and prepare the engine.
-        Safe to call multiple times — only loads once.
-        """
+        """Prepare GuardGPT components and models."""
         if self._ready:
             return
-        logger.info("GuardEngine starting — loading dataset ...")
-        self._loader.load()
-        self._ready = True
-        logger.info(
-            "GuardEngine ready | Dataset: %d records | Llama: %s",
-            self._loader.record_count,
-            "ONLINE" if self._llama.is_available() else "OFFLINE",
-        )
 
-    def process(self, prompt: str) -> EngineResponse:
-        """
-        Run one user prompt through the full safety pipeline.
+        logger.info("Starting GuardGPT...")
 
-        Steps:
-          1. Auto-startup if not already loaded
-          2. Handle empty prompts immediately
-          3. Run IntentClassifier (Layer 1 + Layer 2)
-          4. Run ConversationGuard (history check)
-          5. Run DecisionEngine (final verdict)
-          6. Call Llama if allowed, skip if blocked
+        try:
+            self._loader.load()
 
-        Returns an EngineResponse with all results.
-        """
+            # Share Sentence-BERT model instance to optimize startup and memory
+            if hasattr(self._loader, "_model") and self._loader._model is not None:
+                self._classifier._model = self._loader._model
+
+            self._ready = True
+            logger.info("GuardGPT ready | Dataset: %d records", self._loader.record_count)
+
+        except Exception as error:
+            logger.exception("GuardGPT startup failed.")
+            raise RuntimeError(f"GuardGPT could not start: {error}") from error
+
+    def process(
+        self,
+        prompt: str,
+    ) -> EngineResponse:
+        """Process one prompt through the complete GuardGPT pipeline."""
         if not self._ready:
             self.startup()
 
-        # Step 2: reject empty input immediately
-        stripped = prompt.strip()
-        if not stripped:
+        prompt = prompt.strip() if prompt else ""
+
+        if not prompt:
             return self._empty_response()
 
-        # Step 3: classify the prompt
-        result = self._classifier.classify(stripped)
+        # Step 1: Intent Classification
+        try:
+            classifier_output = self._classifier.classify(prompt)
+        except Exception as error:
+            logger.exception("Intent classification failed.")
+            return self._error_response(prompt, f"Intent classification failed: {error}")
 
-        # Step 4: check conversation history
-        result = self._guard.evaluate(result)
+        result = self._build_guard_result(prompt, classifier_output)
 
-        # Step 5: make final decision
-        decision = self._decision.decide(result, turn_index=self._guard.turn_count)
+        # Step 2: Semantic Dataset Matching
+        try:
+            dataset_record = self._loader.query(prompt)
+        except Exception as error:
+            logger.warning("FAISS semantic search failed: %s", error)
+            dataset_record = None
 
-        # Step 6: call Llama only if the prompt was allowed
-        if decision.allowed:
-            llama_text, error = self._call_llama(stripped)
-            return EngineResponse(
-                allowed        = True,
-                intent         = decision.intent,
-                risk_level     = decision.risk_level,
-                decision       = decision,
-                llama_response = llama_text,
-                error          = error,
-            )
+        if dataset_record:
+            result.dataset_match_confidence = float(dataset_record.get("_similarity", 0.0) or 0.0)
+            result.matched_record_id = self._get_record_id(dataset_record)
+            result.matched_record_intent = dataset_record.get("intent")
+            result.category_scores = self._extract_category_scores(dataset_record)
         else:
-            return EngineResponse(
-                allowed         = False,
-                intent          = decision.intent,
-                risk_level      = decision.risk_level,
-                decision        = decision,
-                blocked_message = decision.user_message,
-            )
+            result.dataset_match_confidence = 0.0
+            result.matched_record_id = None
+            result.matched_record_intent = None
+            result.category_scores = {}
 
-    def new_conversation(self) -> None:
-        """Reset conversation history. Called when user types /new."""
-        self._guard.reset()
-        logger.info("Conversation reset for session %s.", self.session_id)
-
-    def run_interactive(self) -> None:
-        """
-        Start the interactive command-line chat loop.
-
-        Reads user input, processes it, and prints results.
-        Runs until the user types 'exit' or presses Ctrl+C.
-        """
-        self.startup()
-        _print_banner()
-
-        while True:
-            try:
-                user_input = input("\n\033[96mYou:\033[0m ").strip()
-            except (EOFError, KeyboardInterrupt):
-                # User pressed Ctrl+C or closed stdin
-                print("\n\n\033[90mSession ended.\033[0m")
-                break
-
-            # Skip empty input
-            if not user_input:
-                continue
-
-            # Handle built-in commands
-            if user_input.lower() in ("exit", "quit", "/exit", "/quit"):
-                print("\n\033[90mGoodbye!\033[0m")
-                break
-
-            if user_input.lower() in ("/new", "/reset"):
-                self.new_conversation()
-                print("\033[90m[Conversation history cleared. Fresh start!]\033[0m")
-                continue
-
-            if user_input.lower() == "/status":
-                self.print_status()
-                continue
-
-            # Process the prompt and display result
-            response = self.process(user_input)
-            print_response(response)
-
-    def print_status(self) -> None:
-        """Print current engine status — dataset info, Llama availability, etc."""
-        print(
-            f"\n\033[90m"
-            f"  Session ID  : {self.session_id}\n"
-            f"  Turns       : {self._guard.turn_count}\n"
-            f"  Flagged     : {self._guard.is_flagged}\n"
-            f"  Dataset     : {self._loader.record_count:,} records "
-            f"(loaded in {self._loader.load_time:.2f}s)\n"
-            f"  Llama online: {self._llama.is_available()}\n"
-            f"\033[0m"
+        # Step 3: Combine Intent + Semantic Information
+        result.risk_level = self._estimate_risk(
+            intent=result.intent,
+            intent_confidence=result.intent_confidence,
+            similarity=result.dataset_match_confidence,
         )
 
+        result.final_blocked = self._should_preliminarily_block(result)
+
+        if result.final_blocked and not result.block_reason:
+            result.block_reason = f"High-risk intent detected: {result.intent}"
+
+        # Step 4: Conversation Guard Multi-turn Tracking
+        conversation = self._guard.evaluate_result(result)
+        result.history_triggered = conversation.history_triggered
+        result.history_block_reason = conversation.history_block_reason
+
+        if conversation.history_triggered:
+            result.final_blocked = True
+            if conversation.history_block_reason:
+                result.reason_codes.append("history_unsafe")
+
+        # Step 5: Final Decision
+        decision = self._decision.decide(
+            result,
+            turn_index=conversation.turn_index,
+        )
+
+        # Step 6: Blocked Request
+        if not decision.allowed:
+            return EngineResponse(
+                allowed=False,
+                intent=decision.intent,
+                risk_level=decision.risk_level,
+                decision=decision,
+                blocked_message=decision.user_message,
+            )
+
+        # Step 7: Allowed Request -> Llama
+        llama_text, error = self._call_llama(prompt)
+
+        return EngineResponse(
+            allowed=True,
+            intent=decision.intent,
+            risk_level=decision.risk_level,
+            decision=decision,
+            llama_response=llama_text,
+            error=error,
+        )
+
+    @staticmethod
+    def _build_guard_result(prompt: str, classifier_output) -> GuardResult:
+        if isinstance(classifier_output, GuardResult):
+            classifier_output.prompt = prompt
+            return classifier_output
+
+        if isinstance(classifier_output, dict):
+            intent = str(classifier_output.get("intent", "unknown"))
+            confidence = float(
+                classifier_output.get(
+                    "confidence", classifier_output.get("intent_confidence", 0.0)
+                ) or 0.0
+            )
+            risk_level = str(classifier_output.get("risk_level", "safe"))
+
+            return GuardResult(
+                prompt=prompt,
+                intent=intent,
+                intent_confidence=confidence,
+                risk_level=risk_level,
+                category_scores=dict(classifier_output.get("category_scores", {}) or {}),
+                dataset_match_confidence=0.0,
+                matched_record_id=None,
+                matched_record_intent=None,
+                final_blocked=False,
+                block_reason="",
+                reason_codes=list(classifier_output.get("reason_codes", []) or []),
+                history_triggered=False,
+                history_block_reason="",
+            )
+
+        raise TypeError("IntentClassifier.classify() must return a GuardResult or dictionary.")
+
+    @staticmethod
+    def _should_preliminarily_block(result: GuardResult) -> bool:
+        """Optimized preliminary block thresholds based on confidence and similarity."""
+        intent = result.intent
+        confidence = result.intent_confidence
+        similarity = result.dataset_match_confidence
+
+        if intent in {"self_harm", "self_harm_risk"}:
+            return confidence >= 0.40
+
+        if intent in {"harmful", "cyber_abuse", "illegal", "prompt_injection", "jailbreak"}:
+            return confidence >= 0.45
+
+        matched_record_is_safe = (
+            result.matched_record_intent == "safe"
+            or (result.category_scores.get("safe", 0.0) > 0.5)
+        )
+
+        is_educational = intent in {"educational", "coding", "benign"}
+        threshold = 0.85 if is_educational else 0.70
+
+        if similarity >= threshold and not matched_record_is_safe:
+            return True
+
+        return False
+
+    @staticmethod
+    def _estimate_risk(intent: str, intent_confidence: float, similarity: float) -> str:
+        """Estimate risk level based on normalized metrics."""
+        if intent in {"self_harm", "self_harm_risk"}:
+            return "critical" if intent_confidence >= 0.50 else "high"
+
+        if intent in {"harmful", "cyber_abuse", "illegal", "prompt_injection", "jailbreak"}:
+            return "high" if intent_confidence >= 0.55 else "medium"
+
+        is_educational = intent in {"educational", "coding", "benign"}
+        high_threshold = 0.85 if is_educational else 0.70
+        med_threshold = 0.80 if is_educational else 0.55
+
+        if similarity >= high_threshold:
+            return "high"
+        if similarity >= med_threshold:
+            return "medium"
+        if similarity >= 0.40:
+            return "low"
+
+        return "safe"
+
+    @staticmethod
+    def _get_record_id(record: dict) -> Optional[str]:
+        for key in ("id", "record_id", "prompt_id", "uuid"):
+            value = record.get(key)
+            if value is not None:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _extract_category_scores(record: dict) -> dict:
+        for key in ("category_scores", "scores", "safety_scores"):
+            value = record.get(key)
+            if isinstance(value, dict):
+                return dict(value)
+        return {}
+
+    def new_conversation(self) -> None:
+        """Reset conversation history."""
+        self._guard.reset()
+        logger.info("Conversation reset | session=%s", self.session_id)
+
     def _call_llama(self, prompt: str) -> tuple[Optional[str], Optional[str]]:
-        """
-        Send an approved prompt to Llama and return the response.
-        Returns (response_text, error_message).
-        On success: (text, None). On failure: (None, error_string).
-        """
         try:
-            text = self._llama.generate(prompt, system_prompt=SYSTEM_PROMPT)
-            return text, None
-        except ConnectionError as e:
-            logger.warning("Llama connection error: %s", e)
-            return None, str(e)
-        except RuntimeError as e:
-            logger.error("Llama runtime error: %s", e)
-            return None, str(e)
+            response = self._llama.generate(prompt, system_prompt=SYSTEM_PROMPT)
+            return response, None
+        except Exception as error:
+            return None, str(error)
 
     def _empty_response(self) -> EngineResponse:
-        """
-        Return a blocked response for empty/whitespace-only prompts.
-        Skips the full pipeline to avoid wasted processing.
-        """
-        empty_decision = DecisionOutput(
-            allowed=False, intent="empty", risk_level="safe",
+        decision = DecisionOutput(
+            allowed=False,
+            intent="empty",
+            risk_level="safe",
             user_message="Please enter a message.",
-            technical_reason="empty input",
-            category_scores={}, reason_codes=[],
+            technical_reason="Empty input.",
+            category_scores={},
+            reason_codes=["empty_input"],
             dataset_match_confidence=0.0,
             matched_record_id=None,
             history_triggered=False,
             turn_index=self._guard.turn_count + 1,
         )
         return EngineResponse(
-            allowed=False, intent="empty", risk_level="safe",
-            decision=empty_decision,
+            allowed=False,
+            intent="empty",
+            risk_level="safe",
+            decision=decision,
             blocked_message="Please enter a message.",
         )
 
+    def _error_response(self, prompt: str, error: str) -> EngineResponse:
+        decision = DecisionOutput(
+            allowed=False,
+            intent="unknown",
+            risk_level="high",
+            user_message="The prompt could not be safely classified and was blocked.",
+            technical_reason=error,
+            category_scores={},
+            reason_codes=["classifier_error"],
+            dataset_match_confidence=0.0,
+            matched_record_id=None,
+            history_triggered=False,
+            turn_index=self._guard.turn_count + 1,
+        )
+        return EngineResponse(
+            allowed=False,
+            intent="unknown",
+            risk_level="high",
+            decision=decision,
+            blocked_message=decision.user_message,
+            error=error,
+        )
 
-# ── CLI display functions ─────────────────────────────────────────────────────
-# These are module-level functions (not class methods) so main.py can
-# import and use them directly for demo mode.
+    def print_status(self) -> None:
+        """Print current GuardGPT system status."""
+        try:
+            llama_available = self._llama.is_available()
+        except Exception:
+            llama_available = False
 
-def print_response(resp: EngineResponse) -> None:
-    """
-    Print a nicely formatted, colour-coded response to the terminal.
+        print(
+            "\n"
+            "================ GuardGPT Status ================\n"
+            f"Session ID : {self.session_id}\n"
+            f"Ready      : {self._ready}\n"
+            f"Turns      : {self._guard.turn_count}\n"
+            f"Flagged    : {self._guard.is_flagged}\n"
+            f"Dataset    : {self._loader.record_count:,} records\n"
+            f"Llama      : {llama_available}\n"
+            "=================================================\n"
+        )
 
-    Shows: intent, risk level, confidence, decision (ALLOWED/BLOCKED)
-    Then shows either the LLM response or the block message.
-    """
-    d   = resp.decision
-    col = _COLOURS.get(resp.risk_level, "")
+    def run_interactive(self) -> None:
+        """Start GuardGPT interactive terminal mode."""
+        self.startup()
+        _print_banner()
 
-    # Print the summary header
-    print(
-        f"\n  \033[90m{'─' * 50}\033[0m"
-        f"\n  Intent    : \033[1m{resp.intent}\033[0m"
-        f"\n  Risk      : {col}{resp.risk_level.upper()}{_RESET}"
-        f"\n  Confidence: {d.dataset_match_confidence:.0%}"
-        f"\n  Decision  : "
-        + ("\033[92m✓ ALLOWED\033[0m" if resp.allowed else "\033[91m✗ BLOCKED\033[0m")
-    )
+        while True:
+            try:
+                user_input = input("\nYou: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nSession ended.")
+                break
 
-    if resp.allowed:
-        # Show LLM response if available
-        if resp.llama_response:
-            print(f"\n\033[97mGuardGPT:\033[0m {resp.llama_response}")
-        elif resp.error:
-            # Llama is unavailable — show helpful tip
-            print(
-                f"\n\033[93m[Llama unavailable]\033[0m {resp.error}\n"
-                "  Tip: run \033[1mollama serve\033[0m in another terminal."
-            )
+            if not user_input:
+                continue
+
+            if user_input.lower() in {"exit", "quit", "/exit", "/quit"}:
+                print("\nGoodbye!")
+                break
+
+            if user_input.lower() in {"/new", "/reset"}:
+                self.new_conversation()
+                print("\nConversation history cleared.")
+                continue
+
+            if user_input.lower() == "/status":
+                self.print_status()
+                continue
+
+            response = self.process(user_input)
+            print_response(response)
+
+
+# ============================================================
+# RESPONSE DISPLAY & HELPER FUNCTIONS
+# ============================================================
+
+def print_response(response: EngineResponse) -> None:
+    """Display an EngineResponse in the terminal."""
+    decision = response.decision
+    colour = _COLOURS.get(response.risk_level, "")
+
+    print("\n" + "-" * 60)
+    print(f"Intent     : {response.intent}")
+
+    if hasattr(decision, "intent_confidence"):
+        print(f"Intent Conf: {decision.intent_confidence:.1%}")
+
+    print(f"Risk       : {colour}{response.risk_level.upper()}{_RESET}")
+    print(f"Similarity : {decision.dataset_match_confidence:.1%}")
+
+    if response.allowed:
+        print("Decision   : \033[92mALLOWED\033[0m")
+        if response.llama_response:
+            print(f"\nGuardGPT: {response.llama_response}")
+        elif response.error:
+            print(f"\nLlama unavailable: {response.error}")
     else:
-        # Show block message — [HISTORY] if caused by history, [BLOCKED] if direct
-        tag = "[HISTORY]" if resp.decision.history_triggered else "[BLOCKED]"
-        print(f"\n\033[91m{tag}\033[0m {resp.blocked_message}")
+        print("Decision   : \033[91mBLOCKED\033[0m")
+        print(f"\nGuardGPT: {response.blocked_message}")
+
+    if decision.reason_codes:
+        print("\nReason     : " + ", ".join(decision.reason_codes))
+
+    print("-" * 60)
 
 
 def _print_banner() -> None:
-    """Print the GuardGPT welcome banner at the start of a session."""
+    """Display the GuardGPT terminal banner."""
     print(
-        "\n\033[1;96m"
-        "╔══════════════════════════════════════════════╗\n"
-        "║          GuardGPT  –  Safety Engine          ║\n"
-        "║   conversation-aware  ·  dataset-backed      ║\n"
-        "╚══════════════════════════════════════════════╝\n"
-        "\033[0m"
-        "  Commands: /new (reset history)  |  /status  |  exit\n"
+        "\n"
+        "==============================================\n"
+        "              GuardGPT\n"
+        "      Intelligent Prompt Analysis\n"
+        "==============================================\n"
+        "Commands:\n"
+        "  /new     Reset conversation\n"
+        "  /status  Show system status\n"
+        "  exit     Quit\n"
+        "=============================================="
     )
