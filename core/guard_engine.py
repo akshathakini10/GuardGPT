@@ -5,8 +5,9 @@
 #   Main controller for the GuardGPT security pipeline.
 #
 # PIPELINE:
-#   User Prompt -> IntentClassifier -> DatasetLoader (FAISS)
-#   -> ConversationGuard -> DecisionEngine -> ALLOW / BLOCK -> Llama
+#   User Prompt -> Input Sanitization -> IntentClassifier 
+#   -> DatasetLoader (FAISS) -> ConversationGuard 
+#   -> DecisionEngine -> ALLOW / BLOCK -> Llama
 # ============================================================
 
 import logging
@@ -109,6 +110,31 @@ class GuardEngine:
             logger.exception("GuardGPT startup failed.")
             raise RuntimeError(f"GuardGPT could not start: {error}") from error
 
+    @staticmethod
+    def _sanitize_input(prompt: str) -> str:
+        """
+        Sanitizes and normalizes user input to ensure pipeline stability.
+        - Strips surrounding whitespace
+        - Filters out non-printable control characters (preserves newlines, carriage returns, tabs)
+        - Enforces a maximum character length limit to prevent memory spikes
+        """
+        if not prompt:
+            return ""
+
+        # Step 1: Strip leading/trailing whitespace
+        prompt = prompt.strip()
+
+        # Step 2: Strip unprintable / control characters (e.g., null bytes \x00)
+        prompt = "".join(char for char in prompt if char.isprintable() or char in "\n\r\t")
+
+        # Step 3: Enforce maximum input length bound (e.g., 2000 characters)
+        MAX_PROMPT_LENGTH = 2000
+        if len(prompt) > MAX_PROMPT_LENGTH:
+            logger.warning("Prompt exceeded maximum length (%d chars); truncated.", MAX_PROMPT_LENGTH)
+            prompt = prompt[:MAX_PROMPT_LENGTH]
+
+        return prompt
+
     def process(
         self,
         prompt: str,
@@ -117,7 +143,8 @@ class GuardEngine:
         if not self._ready:
             self.startup()
 
-        prompt = prompt.strip() if prompt else ""
+        # Step 0: Input Sanitization & Validation
+        prompt = self._sanitize_input(prompt)
 
         if not prompt:
             return self._empty_response()
