@@ -40,7 +40,7 @@ class EstimateRiskTests(unittest.TestCase):
 
     def test_self_harm_critical_at_or_above_threshold(self) -> None:
         self.assertEqual(
-            estimate_risk("self_harm", SELF_HARM_CRITICAL_CONFIDENCE, 0.0),
+            estimate_risk("self_harm", max(SELF_HARM_CONFIDENCE, SELF_HARM_CRITICAL_CONFIDENCE), 0.0),
             "critical",
         )
         self.assertEqual(
@@ -48,10 +48,10 @@ class EstimateRiskTests(unittest.TestCase):
             "critical",
         )
 
-    def test_self_harm_high_below_threshold(self) -> None:
+    def test_self_harm_below_gate_uses_remaining_evidence(self) -> None:
         self.assertEqual(
-            estimate_risk("self_harm", SELF_HARM_CRITICAL_CONFIDENCE - 0.01, 0.0),
-            "high",
+            estimate_risk("self_harm", SELF_HARM_CONFIDENCE - 0.01, 0.0),
+            "safe",
         )
 
     def test_harm_intent_high_at_or_above_threshold(self) -> None:

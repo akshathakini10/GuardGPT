@@ -40,6 +40,7 @@ def _loader() -> DatasetLoader:
         loader.load()
     except Exception as error:
         logger.warning("DatasetLoader could not load: %s", error)
+        raise RuntimeError("Dataset unavailable") from error
     return loader
 
 
@@ -98,6 +99,7 @@ def moderate_content(
                 category_scores = {str(k): float(v) for k, v in scores.items()}
     except Exception as error:
         logger.warning("Dataset query failed in content_moderation: %s", error)
+        raise RuntimeError("Dataset query failed") from error
 
     categories: list[str] = []
     reasons: list[str] = []

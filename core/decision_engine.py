@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 from core.risk_estimator import (  # noqa: F401
     HIGH_RISK_INTENT_CONFIDENCE,
     SELF_HARM_CONFIDENCE,
+    SELF_HARM_CRITICAL_CONFIDENCE,
     SEMANTIC_BLOCK_THRESHOLD,
     SEMANTIC_RISK_THRESHOLD,
     EDUCATIONAL_SEMANTIC_BLOCK_THRESHOLD,
@@ -60,6 +61,7 @@ UNSAFE_DATASET_LABELS = {
 }
 
 UNSAFE_INTENTS = {
+    "unsafe",
     "harmful",
     "harmful_instructions",
     "cyber_abuse",
@@ -131,6 +133,7 @@ class DecisionEngine:
     def __init__(
         self,
         audit_log_path: str = "logs/guardgpt_audit.jsonl",
+        write_audit: bool = True,
     ) -> None:
         import os
 
@@ -140,6 +143,7 @@ class DecisionEngine:
             if root:
                 resolved = Path(root).resolve() / resolved
         self.audit_log_path = resolved
+        self.write_audit = write_audit
         logger.info("DecisionEngine initialized.")
 
     # ========================================================
@@ -213,10 +217,13 @@ class DecisionEngine:
         history_block = HISTORY_BLOCK_ENABLED and history_triggered
 
         dataset_label = self._get_strongest_dataset_label(category_scores)
-        dataset_label_unsafe = dataset_label in UNSAFE_DATASET_LABELS
+        dataset_label_unsafe = (
+            dataset_label in UNSAFE_DATASET_LABELS
+            and self._safe_float(category_scores.get(dataset_label, 0.0)) >= 0.5
+        )
 
         # Educational / Conceptual intent check
-        is_educational = intent in {"educational", "coding", "benign"}
+        is_educational = intent in {"educational", "coding", "benign", "account_recovery"}
 
         # Dynamic Threshold Selection based on Intent Context
         required_block_threshold = (
@@ -269,6 +276,9 @@ class DecisionEngine:
             or dataset_label_unsafe
         )
 
+        # Keep raw similarity in the report; safe matches are not risk evidence.
+        risk_similarity = 0.0 if matched_record_is_safe else similarity
+
         # Rule 4: Strong semantic dataset match
         if semantic_match and not matched_record_is_safe:
             should_block = True
@@ -278,7 +288,7 @@ class DecisionEngine:
             )
 
         # Rule 5: Unsafe dataset category
-        if matched_record_unsafe and strong_semantic_risk:
+        if matched_record_unsafe and strong_semantic_risk and not matched_record_is_safe:
             should_block = True
             reason_codes.append("unsafe_dataset_category")
             technical_reasons.append(
@@ -304,7 +314,7 @@ class DecisionEngine:
         final_risk = self._calculate_final_risk(
             intent=intent,
             intent_confidence=intent_confidence,
-            similarity=similarity,
+            similarity=risk_similarity,
             history_triggered=history_triggered,
             should_block=should_block,
         )
@@ -320,7 +330,7 @@ class DecisionEngine:
         else:
             allowed = False
             user_message = self._build_block_message(
-                intent=intent,
+                intent="unknown" if intent in CRITICAL_INTENTS and not critical_intent else intent,
                 history_triggered=history_triggered,
             )
             technical_reason = (
@@ -337,7 +347,7 @@ class DecisionEngine:
             allowed=allowed,
             final_risk=final_risk,
             intent=intent,
-            similarity=similarity,
+            similarity=risk_similarity,
         )
 
         sanitized_prompt = (
@@ -349,6 +359,28 @@ class DecisionEngine:
             if action == "SANITIZE"
             else None
         )
+
+        allowed = action != "BLOCK"
+
+        if action == "BLOCK" and not reason_codes:
+            if high_risk_intent:
+                reason_codes.append("high_risk_intent")
+            elif critical_intent:
+                reason_codes.append("critical_intent")
+            elif preliminary_block:
+                reason_codes.append("preliminary_block_triggered")
+            else:
+                reason_codes.append("security_policy_violation")
+
+        if action == "SANITIZE" and not reason_codes:
+            if final_risk == "medium":
+                reason_codes.append("medium_risk_similarity")
+            elif intent in UNSAFE_INTENTS:
+                reason_codes.append("unsafe_intent_caution")
+            else:
+                reason_codes.append("sanitization_required")
+
+        reason_codes = list(dict.fromkeys(reason_codes))
 
         output = DecisionOutput(
             allowed=allowed,
@@ -374,7 +406,8 @@ class DecisionEngine:
         # AUDIT LOG
         # ====================================================
 
-        self._write_audit_log(result=result, decision=output)
+        if self.write_audit:
+            self._write_audit_log(result=result, decision=output)
 
         logger.info(
             "Decision=%s | intent=%s | risk=%s | similarity=%.3f",
@@ -387,7 +420,7 @@ class DecisionEngine:
         return output
 
     # ========================================================
-    # FINAL RISK
+    # FINAL RISK & ACTION
     # ========================================================
 
     @staticmethod
@@ -426,7 +459,7 @@ class DecisionEngine:
                 "self_harm",
                 "self_harm_risk",
             }
-            if intent in unsafe_intents or similarity >= 0.55:
+            if intent in unsafe_intents:
                 return "SANITIZE", "CAUTION"
 
         return "ALLOW", "SAFE"
@@ -439,9 +472,7 @@ class DecisionEngine:
     ) -> Optional[str]:
         """
         Produce a minimal, conservative sanitization of the prompt for the
-        SANITIZE action. This is NOT a full rewriter - it is a safety wrapper
-        to keep the prompt downstream-safe while preserving user intent where
-        possible.
+        SANITIZE action.
         """
         text = str(prompt or "").strip()
         if not text:
@@ -476,17 +507,20 @@ class DecisionEngine:
         history_triggered: bool,
         should_block: bool,
     ) -> str:
-        if intent in CRITICAL_INTENTS:
-            return "critical" if intent_confidence >= 0.50 else "high"
+        if intent in CRITICAL_INTENTS and intent_confidence >= SELF_HARM_CONFIDENCE:
+            return "critical" if intent_confidence >= SELF_HARM_CRITICAL_CONFIDENCE else "high"
 
         if should_block:
             if intent in HIGH_RISK_INTENTS or similarity >= 0.85 or history_triggered:
                 return "high"
             return "medium"
 
-        if similarity >= 0.80:
+        is_educational = intent in {"educational", "coding", "benign", "account_recovery"}
+        med_thresh = EDUCATIONAL_SEMANTIC_RISK_THRESHOLD if is_educational else SEMANTIC_RISK_THRESHOLD
+
+        if similarity >= med_thresh:
             return "medium"
-        if similarity >= 0.55:
+        if not is_educational and similarity >= 0.55:
             return "low"
 
         return "safe"

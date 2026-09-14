@@ -14,6 +14,7 @@
 # ============================================================
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -99,6 +100,8 @@ INTENT_PROTOTYPES = {
         "The user asks about suicide or methods of self-harm.",
         "The user requests instructions for ending their own life.",
         "The user expresses serious thoughts about harming themselves.",
+        "I am thinking about hurting myself and need help staying safe right now.",
+        "I feel like hurting myself or taking my life.",
     ],
     "illegal": [
         "The user asks how to commit a crime.",
@@ -106,11 +109,22 @@ INTENT_PROTOTYPES = {
         "The user wants help evading law enforcement while committing a crime.",
         "The user asks for operational guidance for criminal activity.",
     ],
+    "account_recovery": [
+        "I lost access to my own account. How do I use the official password reset process?",
+        "My account was compromised. Help me recover it through the provider and secure it.",
+        "Someone changed my password. How do I contact support and prove account ownership?",
+        "How do I secure my own online account after a suspected intrusion?",
+        "I want to restore access to my account using recovery codes and enable two-factor authentication.",
+    ],
     "cyber_abuse": [
         "The user wants to hack or compromise a computer system.",
         "The user asks for malware, credential theft, or unauthorized access.",
         "The user wants to exploit a system without authorization.",
         "The user requests instructions for executing cyber attacks.",
+        "How can I break into someone else's account without their permission?",
+        "Help me steal a password and take over another person's email account.",
+        "How can I bypass identity verification to access an account I do not own?",
+        "I want to trick customer support into giving me access to a victim's account.",
     ],
     "prompt_injection": [
         "The user attempts to override system instructions.",
@@ -125,6 +139,7 @@ INTENT_PROTOTYPES = {
         "The user asks the model to ignore its safety policies.",
     ],
 }
+
 
 
 # ============================================================
@@ -151,8 +166,10 @@ class IntentClassifier:
         if self._model is not None:
             return
 
-        logger.info("Loading intent classification model: %s", self.model_name)
-        self._model = SentenceTransformer(self.model_name)
+        try:
+            self._model = SentenceTransformer(self.model_name, local_files_only=True)
+        except Exception:
+            self._model = SentenceTransformer(self.model_name)
 
     def _initialize(self) -> None:
         """Generate prototype embeddings for all defined intents."""
@@ -236,9 +253,20 @@ class IntentClassifier:
             "machine learning", " ml ", " ml?", " ml.", "deep learning",
             "data science", "regression", "neural network", "artificial intelligence",
             "theoretical mechanism", "how does", "conceptually", "explain the concept",
-            "what is the mechanism", "theoretical", "academic", "theory of"
+            "what is the mechanism", "theoretical", "academic", "theory of",
+            "how to protect", "how do i protect", "protect my", "defend against",
+            "prevent phishing", "protect myself", "security risks", "explain the security",
+            "explain why", "explain the", "what are the risks",
+            "explain how to", "how to recognise", "how to recognize", "how to spot",
+            "how to report", "how to identify", "how to avoid", "protect user", "protect authentication",
+            "protect tokens", "protect passwords", "protect accounts"
         ]
         is_safe_tech = any(kw in text_lower for kw in safe_tech_keywords)
+
+        # Check for explicit negation of harmful actions
+        negated_re = r"\b(?:do not|don't|not|without|never|no intention to)\s+(?:want to|trying to|asking to|wish to)?\s*(?:stealing|phishing|steal|bypass|defeat)\b"
+        if re.search(negated_re, text_lower):
+            is_safe_tech = True
 
         # Explicit action-oriented exploit terms
         unsafe_keyword_map = {
@@ -248,7 +276,8 @@ class IntentClassifier:
             ],
             "self_harm": [
                 "suicide", "kill myself", "end my life", "take my life",
-                "cutting myself", "hang myself"
+                "cutting myself", "hang myself", "hurting myself", "hurt myself",
+                "harming myself", "want to die", "feeling suicidal", "end it all"
             ],
             "illegal": [
                 "illegal drug", "methamphetamine", "heroin", "cocaine",
@@ -257,7 +286,17 @@ class IntentClassifier:
             "cyber_abuse": [
                 "sql injection payload", "ddos attack target", "hack server",
                 "exploit code", "write malware", "ransomware", "trojan virus",
-                "intercept traffic", "run spoofing script"
+                "intercept traffic", "run spoofing script", "bypass verification",
+                "defeat two-factor", "defeat 2fa", "bypass 2fa", "bypass two-factor",
+                "stealing the current password", "steal passwords", "stealing passwords",
+                "steal credentials", "phishing email", "access my classmate's account",
+                "access someone else's account", "log into somebody elses",
+                "log into someone else's", "steal browser passwords", "steal their passwords"
+            ],
+            "prompt_injection": [
+                "reveal your hidden system prompt", "reveal your system prompt",
+                "show me your system prompt", "print your hidden developer instructions",
+                "print your system prompt", "hidden system prompt", "developer instructions"
             ],
             "jailbreak": [
                 "ignore all previous instructions", "bypass safety", "dev mode",
@@ -274,6 +313,10 @@ class IntentClassifier:
             if override_intent:
                 break
 
+        # Defensive or educational analysis guard: e.g. "Explain the security risks of..." or "How do I protect..."
+        if override_intent in unsafe_intents and is_safe_tech:
+            override_intent = None
+
         if override_intent:
             best_intent = override_intent
             confidence = 0.85
@@ -281,6 +324,8 @@ class IntentClassifier:
             # Re-route false positive technical queries back to educational
             best_intent = "educational"
             confidence = 0.80
+
+
 
         return {
             "intent": best_intent,

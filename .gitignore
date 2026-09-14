@@ -21,6 +21,11 @@ logs/
 # Environment / secrets
 .env
 
+# Temporary backups and reports
+backup_*/
+account_classifier_*.json
+*.zip
+
 # IDE / OS
 .vscode/
 .idea/

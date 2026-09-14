@@ -3,6 +3,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from core.risk_estimator import SELF_HARM_CONFIDENCE, SELF_HARM_INTENTS
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,10 @@ class ConversationGuard:
         history_triggered = False
         history_reason = ""
 
-        if previous_block and intent in UNSAFE_INTENTS:
+        supported_intent = intent in UNSAFE_INTENTS and (
+            intent not in SELF_HARM_INTENTS or intent_confidence >= SELF_HARM_CONFIDENCE
+        )
+        if previous_block and supported_intent:
             history_triggered = True
             history_reason = "Unsafe intent continued from a previous blocked message."
         elif previous_block and not is_blocked:

@@ -22,12 +22,11 @@ from typing import Any
 # ============================================================
 
 # Minimum intent-classifier confidence required for an intent-based block.
-# Was 0.45 in core.guard_engine._should_preliminarily_block — raised because
-# IntentClassifier.classify returns (raw_cosine + 1) / 2, so 0.45 maps to
-# a raw cosine of -0.10 (negative similarity) which is essentially noise.
 HIGH_RISK_INTENT_CONFIDENCE = 0.65
 
-SELF_HARM_CONFIDENCE = 0.40
+# Confidence gate for a self-harm classifier label to count as risk evidence.
+# This is a model score, not a calibrated probability.
+SELF_HARM_CONFIDENCE = 0.65
 
 # Semantic-match thresholds for general prompts.
 SEMANTIC_BLOCK_THRESHOLD = 0.70
@@ -50,7 +49,7 @@ SELF_HARM_CRITICAL_CONFIDENCE = 0.50
 
 SELF_HARM_INTENTS = {"self_harm", "self_harm_risk"}
 
-EDUCATIONAL_INTENTS = {"educational", "coding", "benign"}
+EDUCATIONAL_INTENTS = {"educational", "coding", "benign", "account_recovery"}
 
 HARM_INTENTS = {
     "harmful",
@@ -70,13 +69,17 @@ def estimate_risk(
     intent: str,
     intent_confidence: float,
     similarity: float,
+    matched_record_intent: str | None = None,
 ) -> str:
     """
     Map intent + confidence + dataset similarity to a risk level.
 
+    Note: intent_confidence is a transformed cosine similarity score,
+    not a calibrated probability of harmfulness.
+
     Returns one of: "safe", "low", "medium", "high", "critical".
     """
-    if intent in SELF_HARM_INTENTS:
+    if intent in SELF_HARM_INTENTS and intent_confidence >= SELF_HARM_CONFIDENCE:
         if intent_confidence >= SELF_HARM_CRITICAL_CONFIDENCE:
             return "critical"
         return "high"
@@ -85,6 +88,9 @@ def estimate_risk(
         if intent_confidence >= HIGH_RISK_INTENT_CONFIDENCE:
             return "high"
         return "medium"
+
+    if matched_record_intent == "safe":
+        similarity = 0.0
 
     is_educational = intent in EDUCATIONAL_INTENTS
     high_threshold = (
@@ -102,7 +108,7 @@ def estimate_risk(
         return "high"
     if similarity >= med_threshold:
         return "medium"
-    if similarity >= LOW_SIMILARITY_THRESHOLD:
+    if not is_educational and similarity >= LOW_SIMILARITY_THRESHOLD:
         return "low"
     return "safe"
 
@@ -110,11 +116,6 @@ def estimate_risk(
 def should_preliminarily_block(result_or_mapping: Any) -> bool:
     """
     Cheap first-pass block check used by the legacy GuardEngine.
-
-    Accepts either a `GuardResult` dataclass or a plain dict with the same
-    fields. Replaces `core.guard_engine._should_preliminarily_block`, with
-    the `harmful` threshold raised from the buggy `0.45` to the canonical
-    `HIGH_RISK_INTENT_CONFIDENCE = 0.65`.
     """
     intent = _get_value(result_or_mapping, "intent", "unknown") or "unknown"
     intent = str(intent).lower()
@@ -131,8 +132,8 @@ def should_preliminarily_block(result_or_mapping: Any) -> bool:
         result_or_mapping, "category_scores", {}
     ) or {}
 
-    if intent in SELF_HARM_INTENTS:
-        return confidence >= SELF_HARM_CONFIDENCE
+    if intent in SELF_HARM_INTENTS and confidence >= SELF_HARM_CONFIDENCE:
+        return True
 
     if intent in HARM_INTENTS:
         return confidence >= HIGH_RISK_INTENT_CONFIDENCE

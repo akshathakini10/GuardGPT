@@ -230,10 +230,7 @@ def combine_results(state: GuardState) -> GuardState:
                         reasons.append(value_str)
 
     matched_record_id = prompt_analysis.get("matched_record_id")
-    matched_record_intent = (
-        prompt_analysis.get("matched_record_intent")
-        or prompt_analysis.get("intent")
-    )
+    matched_record_intent = prompt_analysis.get("matched_record_intent")
 
     state["combined_analysis"] = {
         "intent": intent,
@@ -351,7 +348,14 @@ def build_report(state: GuardState) -> dict[str, Any]:
     combined = state.get("combined_analysis") or {}
     prompt_analysis = state.get("prompt_analysis") or {}
 
-    action = str(decision.get("action", "ALLOW") or "ALLOW")
+    if state.get("errors") or decision.get("_error") or not decision:
+        return {"request_id": state.get("request_id"), "prompt": state.get("prompt", ""),
+                "action": "BLOCK", "final_status": "ERROR", "allowed": False,
+                "intent": "unknown", "risk_level": "unknown", "detected_attacks": [],
+                "reasons": ["analysis_failed"], "response": None,
+                "user_message": "A required input check failed."}
+
+    action = str(decision.get("action", "BLOCK") or "BLOCK")
     final_status = str(decision.get("final_status", "SAFE") or "SAFE")
     allowed = bool(decision.get("allowed", action != "BLOCK"))
 

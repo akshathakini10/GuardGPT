@@ -41,8 +41,11 @@ class LlamaBackend:
             self.temperature = DEFAULT_TEMPERATURE
 
         self._session = requests.Session()
+        from urllib.parse import urlparse
+        if urlparse(self.base_url).hostname in {"127.0.0.1", "localhost", "::1"}:
+            self._session.trust_env = False
 
-    def generate(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+    def generate(self, prompt: str, system_prompt: Optional[str] = None, *, schema=None, temperature=None) -> str:
         prompt = str(prompt).strip() if prompt else ""
         if not prompt:
             raise ValueError("Prompt cannot be empty.")
@@ -51,11 +54,18 @@ class LlamaBackend:
             "model": self.model,
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": self.temperature},
+            "options": {"temperature": self.temperature if temperature is None else temperature,
+                        "num_predict": 768, "num_ctx": 8192,
+                        # Discourages the degenerate token-repetition loops seen with
+                        # smaller/general-purpose models under grammar-constrained JSON
+                        # decoding (e.g. an enum array cycling the same 2-3 values).
+                        "repeat_penalty": 1.3, "repeat_last_n": 64},
         }
 
         if system_prompt:
             payload["system"] = str(system_prompt)
+        if schema is not None:
+            payload["format"] = schema
 
         url = f"{self.base_url}/api/generate"
 
@@ -63,16 +73,20 @@ class LlamaBackend:
             response = self._session.post(url, json=payload, timeout=self.timeout)
         except requests.exceptions.ConnectionError as error:
             raise ConnectionError(
-                f"Ollama reachable error at {self.base_url}."
+                "Cannot reach Ollama. Start Ollama and run python main.py --status."
             ) from error
         except Exception as error:
-            raise RuntimeError(f"Ollama generation failed: {error}") from error
+            raise RuntimeError("Ollama generation failed or timed out.") from error
 
         if response.status_code != 200:
-            raise RuntimeError(f"Ollama returned HTTP {response.status_code}: {response.text}")
+            raise RuntimeError(f"Ollama returned HTTP {response.status_code}. Check installed models.")
 
         data = response.json()
-        generated_text = str(data.get("response", "")).strip()
+        if not isinstance(data, dict) or not isinstance(data.get("response"), str):
+            raise RuntimeError("Invalid Ollama response format.")
+        if data.get("done") is not True or data.get("done_reason") == "length":
+            raise RuntimeError("Ollama response was incomplete or exceeded the token limit.")
+        generated_text = data["response"].strip()
 
         if not generated_text:
             raise RuntimeError("Empty response received from backend.")

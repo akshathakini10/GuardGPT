@@ -43,6 +43,7 @@ def _loader() -> DatasetLoader:
         loader.load()
     except Exception as error:
         logger.warning("DatasetLoader could not load: %s", error)
+        raise RuntimeError("Dataset unavailable") from error
     return loader
 
 
@@ -84,6 +85,7 @@ def analyze_prompt(data: PromptAnalysisInput) -> PromptAnalysisOutput:
 
     dataset_match_confidence = 0.0
     matched_record_id = None
+    matched_record_intent = None
     category_scores: dict = {}
 
     try:
@@ -92,14 +94,17 @@ def analyze_prompt(data: PromptAnalysisInput) -> PromptAnalysisOutput:
         if record:
             dataset_match_confidence = float(record.get("_similarity", 0.0) or 0.0)
             matched_record_id = _record_id(record)
+            matched_record_intent = record.get("intent")
             category_scores = _category_scores(record)
     except Exception as error:
         logger.warning("Dataset query failed in prompt_analysis: %s", error)
+        raise RuntimeError("Dataset query failed") from error
 
     risk_level = estimate_risk(
         intent=intent,
         intent_confidence=intent_confidence,
         similarity=dataset_match_confidence,
+        matched_record_intent=matched_record_intent,
     )
 
     reason_codes: list[str] = []
@@ -139,6 +144,7 @@ def analyze_prompt(data: PromptAnalysisInput) -> PromptAnalysisOutput:
         evidence=evidence,
         reason_codes=reason_codes,
         matched_record_id=matched_record_id,
+        matched_record_intent=matched_record_intent,
         dataset_match_confidence=round(dataset_match_confidence, 4),
         requires_jailbreak_check=requires_jailbreak_check,
     )

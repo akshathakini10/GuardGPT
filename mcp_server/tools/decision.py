@@ -56,10 +56,13 @@ def decide(data: DecisionInput) -> DecisionOutput:
 
     decision = _engine().decide(result, turn_index=int(data.turn_index or 0))
 
-    detected_attacks: list[str] = list(data.detected_attacks or [])
-    for code in decision.reason_codes:
-        if code not in detected_attacks:
-            detected_attacks.append(code)
+    labels = {"jailbreak", "prompt_injection", "instruction_override", "system_prompt_extraction",
+              "role_manipulation", "safety_bypass", "jailbreak_attempt", "harm", "toxicity",
+              "harmful_instructions", "cyber_abuse", "illegal", "violence", "hate_speech"}
+    detected_attacks = list(dict.fromkeys(x for x in (data.detected_attacks or []) if x in labels))
+    if decision.action == "SANITIZE":
+        decision.sanitized_prompt = None
+        decision.user_message = "A rewrite is required. Use complete_request to rewrite, recheck and generate."
 
     return DecisionOutput(
         action=str(decision.action),

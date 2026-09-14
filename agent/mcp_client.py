@@ -21,6 +21,9 @@ import asyncio
 import json
 import logging
 import os
+from datetime import timedelta
+import httpx
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
@@ -64,9 +67,12 @@ class ToolResult:
     is_error: bool
 
 
-# ============================================================
-# Async core
-# ============================================================
+class SmartTimeout(float):
+    """Compatible timeout wrapper for both MCP 1.x (expects timedelta.total_seconds())
+    and MCP 2.x / anyio (expects float for deadline math)."""
+    def total_seconds(self) -> float:
+        return float(self)
+
 
 async def _call_mcp_tool_async(
     tool_name: str,
@@ -76,14 +82,20 @@ async def _call_mcp_tool_async(
     read_timeout_seconds: Optional[float] = None,
 ) -> ToolResult:
     try:
-        async with streamable_http_client(url) as (read_stream, write_stream):
+        local = urlparse(url).hostname in {"127.0.0.1", "localhost", "::1"}
+        async with httpx.AsyncClient(timeout=httpx.Timeout(read_timeout_seconds or 900), trust_env=not local) as http_client, streamable_http_client(url, http_client=http_client) as streams:
+            read_stream, write_stream = streams[:2]
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
+                sec = float(read_timeout_seconds.total_seconds() if isinstance(read_timeout_seconds, timedelta) else (read_timeout_seconds or 900))
                 result = await session.call_tool(
                     tool_name,
                     arguments=arguments,
-                    read_timeout_seconds=read_timeout_seconds,
+                    read_timeout_seconds=SmartTimeout(sec),
                 )
+
+
+
     except asyncio.TimeoutError as error:
         raise MCPConnectionError(
             f"Timed out calling tool '{tool_name}' at {url}"
@@ -112,7 +124,9 @@ async def _list_mcp_tools_async(
     url: str = MCP_SERVER_URL,
 ) -> list[str]:
     try:
-        async with streamable_http_client(url) as (read_stream, write_stream):
+        local = urlparse(url).hostname in {"127.0.0.1", "localhost", "::1"}
+        async with httpx.AsyncClient(trust_env=not local) as http_client, streamable_http_client(url, http_client=http_client) as streams:
+            read_stream, write_stream = streams[:2]
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 listed = await session.list_tools()
@@ -138,9 +152,11 @@ def _coerce_tool_result(tool_name: str, result: Any) -> ToolResult:
     if result is None:
         raise MCPToolError(f"Tool '{tool_name}' returned no result.")
 
-    is_error = bool(getattr(result, "is_error", False))
+    is_error = bool(getattr(result, "isError", getattr(result, "is_error", False)))
     content = getattr(result, "content", None)
-    structured = getattr(result, "structured_content", None)
+    structured = getattr(result, "structuredContent", getattr(result, "structured_content", None))
+    if is_error:
+        raise MCPToolError(f"Tool '{tool_name}' failed. No result was accepted.")
 
     if structured:
         if isinstance(structured, dict):
