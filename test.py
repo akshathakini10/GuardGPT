@@ -1,5 +1,4 @@
-from core.dataset_loader import DatasetLoader
-
-loader = DatasetLoader()
-loader.clear_cache()  # Deletes cache/guardgpt_faiss.index and cache/guardgpt_records.json
-loader.load()        # Rebuilds the full index for all records
+"""Compatibility entry point: validate existing data; never rebuild or clear caches."""
+if __name__ == "__main__":
+    from verify_augmented_dataset import main
+    main()

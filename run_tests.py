@@ -8,6 +8,7 @@ suite = unittest.defaultTestLoader.loadTestsFromNames([
     "tests.test_complete_pipeline", "tests.test_complete_http",
     "tests.test_safety_service",
     "tests.test_self_harm_gate",
+    "tests.test_output_review_details", "tests.test_context_boundaries",
 ])
 result = unittest.TextTestRunner(verbosity=2).run(suite)
 raise SystemExit(0 if result.wasSuccessful() else 1)

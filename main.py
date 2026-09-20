@@ -57,7 +57,7 @@ def main():
     try:
         with MCPServerManager(auto_start=True) as url:
             health = call_tool("health", {}, url=url).data
-            if health.get("version") != "2.0":
+            if health.get("version") != "2.0" or health.get("revision") != "audit-context-20260920":
                 raise RuntimeError("Restart the old MCP server to load this update.")
             def request(prompt, session_id=None, check=False):
                 return call_tool("complete_request", {"prompt": prompt, "session_id": session_id,

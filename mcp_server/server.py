@@ -30,7 +30,7 @@ def pipeline():
 
 @mcp.tool()
 def health() -> dict:
-    return {"service": "GuardGPT", "version": "2.0", "complete_pipeline": True}
+    return {"service": "GuardGPT", "version": "2.0", "complete_pipeline": True, "revision": "audit-context-20260920"}
 
 @mcp.tool()
 def complete_request(prompt: str, session_id: str | None = None, check_only: bool = False) -> dict:

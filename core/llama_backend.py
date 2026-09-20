@@ -59,7 +59,7 @@ class LlamaBackend:
                         # Discourages the degenerate token-repetition loops seen with
                         # smaller/general-purpose models under grammar-constrained JSON
                         # decoding (e.g. an enum array cycling the same 2-3 values).
-                        "repeat_penalty": 1.3, "repeat_last_n": 64},
+                        "repeat_penalty": 1.0 if schema is not None else 1.3, "repeat_last_n": 64},
         }
 
         if system_prompt:

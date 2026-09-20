@@ -15,6 +15,7 @@
 
 import logging
 import re
+from core.jailbreak_patterns import _inspection_text, _pattern_hits
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -246,7 +247,7 @@ class IntentClassifier:
         # Convert cosine similarity (-1 to 1) into a confidence score (0 to 1)
         confidence = max(0.0, min(1.0, (raw_score + 1.0) / 2.0))
 
-        text_lower = text.lower()
+        text_lower = _inspection_text(text)
 
         # Keywords indicating educational or conceptual technical intent
         safe_tech_keywords = [
@@ -261,7 +262,17 @@ class IntentClassifier:
             "how to report", "how to identify", "how to avoid", "protect user", "protect authentication",
             "protect tokens", "protect passwords", "protect accounts"
         ]
-        is_safe_tech = any(kw in text_lower for kw in safe_tech_keywords)
+        is_safe_tech = text_lower == "quoted text analysis" or any(kw in text_lower for kw in safe_tech_keywords)
+
+        # Conversational / clarification keywords that re-route false positive unsafe classifications
+        safe_conversational_keywords = [
+            "just joking", "was just joking", "just kidding", "was just kidding",
+            "only joking", "only kidding", "my bad", "never mind", "nevermind",
+            "apologies", "i am sorry", "im sorry"
+        ]
+        is_conversational = text_lower.strip(" .!?") in set(safe_conversational_keywords + [
+            "i was joking", "i am joking", "i'm joking", "i'm sorry", "sorry", "thank you", "thanks"
+        ])
 
         # Check for explicit negation of harmful actions
         negated_re = r"\b(?:do not|don't|not|without|never|no intention to)\s+(?:want to|trying to|asking to|wish to)?\s*(?:stealing|phishing|steal|bypass|defeat)\b"
@@ -314,12 +325,22 @@ class IntentClassifier:
                 break
 
         # Defensive or educational analysis guard: e.g. "Explain the security risks of..." or "How do I protect..."
-        if override_intent in unsafe_intents and is_safe_tech:
+        explicit_hits = _pattern_hits(text)
+        explicit_action = bool(re.search(
+            r"\b(?:make|build|create|write|give|provide)\b.{0,60}\b(?:bomb|weapon|malware|ransomware|phishing email)\b", text_lower))
+        if override_intent in unsafe_intents and is_safe_tech and not explicit_hits and not explicit_action:
             override_intent = None
+
+        if explicit_hits:
+            override_intent = "cyber_abuse" if any(h in explicit_hits for h in (
+                "credential_theft_request", "auth_bypass_request")) else "prompt_injection"
 
         if override_intent:
             best_intent = override_intent
             confidence = 0.85
+        elif is_conversational and (best_intent in unsafe_intents or override_intent is None):
+            best_intent = "benign"
+            confidence = 0.80
         elif is_safe_tech and best_intent in unsafe_intents:
             # Re-route false positive technical queries back to educational
             best_intent = "educational"
@@ -367,8 +388,7 @@ class IntentClassifier:
         }
 
         return {
-            "intent": self._intent_names[best_index],
-            "confidence": round(float((scores[best_index] + 1.0) / 2.0), 4),
+            **self.classify(text),
             "scores": score_dict,
         }
 
