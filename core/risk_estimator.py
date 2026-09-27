@@ -47,17 +47,20 @@ SELF_HARM_CRITICAL_CONFIDENCE = 0.50
 # Intent sets
 # ============================================================
 
-SELF_HARM_INTENTS = {"self_harm", "self_harm_risk"}
+SELF_HARM_INTENTS = {"self_harm_risk"}
 
-EDUCATIONAL_INTENTS = {"educational", "coding", "benign", "account_recovery"}
+# The final trained classifier has exactly six labels. "safe" covers benign,
+# educational, coding, and account-recovery requests at the intent layer.
+EDUCATIONAL_INTENTS = {"safe"}
 
+# Unsafe attack/request intents handled as high-risk when confidence is sufficient.
+# self_harm_risk is kept separate because it routes to support rather than an
+# adversarial refusal path.
 HARM_INTENTS = {
-    "harmful",
-    "harmful_instructions",
-    "cyber_abuse",
-    "illegal",
     "prompt_injection",
     "jailbreak",
+    "harmful_instructions",
+    "manipulation",
 }
 
 
@@ -74,8 +77,9 @@ def estimate_risk(
     """
     Map intent + confidence + dataset similarity to a risk level.
 
-    Note: intent_confidence is a transformed cosine similarity score,
-    not a calibrated probability of harmfulness.
+    Note: intent_confidence is the contextual intent score supplied by the
+    trained/temporal intent pipeline. It should not be interpreted as a fully
+    calibrated probability of harmfulness.
 
     Returns one of: "safe", "low", "medium", "high", "critical".
     """

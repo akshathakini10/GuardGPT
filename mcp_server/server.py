@@ -71,4 +71,11 @@ def audit_logger(data: dict) -> dict:
     return log_audit_event(AuditLoggerInput(**data)).model_dump()
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host=parsed.hostname or "127.0.0.1",
+        port=parsed.port or 8000,
+        streamable_http_path=parsed.path or "/mcp",
+    )
+
+

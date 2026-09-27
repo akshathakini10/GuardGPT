@@ -68,6 +68,7 @@ class CompletePipeline:
         self.audit_log = audit_log or AuditLog()
         self.retries = max(0, min(int(retries), 1))
         self.sessions = OrderedDict()
+        self.dialogue_context = OrderedDict()
         self.lock = threading.RLock()
 
     def run(self, prompt, session_id=None, check_only=False):
@@ -115,6 +116,18 @@ class CompletePipeline:
                 self.sessions[session_id] = ConversationGuard(session_id)
             self.sessions.move_to_end(session_id)
             report["turn_index"] = self.safety.apply_history(analysis, self.sessions[session_id])
+
+        # Keep only the immediately previous successful user/assistant exchange.
+        # This gives short follow-ups such as "continue" enough semantic context
+        # without feeding the whole conversation into generation or auditing.
+        previous_exchange = None
+        if session_id:
+            # Context is valid for exactly the immediately following turn.
+            # Consume it now. Only a successful audited response stores new
+            # context below, so blocked/failed turns cannot leave stale context
+            # for a later "continue" to revive.
+            previous_exchange = self.dialogue_context.pop(session_id, None)
+
         decision = analysis["decision"]
         for key in ("intent", "intent_confidence", "risk_level", "category_scores", "dataset_match_confidence", "matched_record_id"):
             report[key] = decision.get(key)
@@ -162,14 +175,47 @@ class CompletePipeline:
             system = GENERATION_SYSTEM
             if attempt:
                 system += " A prior answer failed review. Give a brief, relevant, non-actionable safe answer or refusal."
-            candidate = self.backend.generate(effective_prompt, system_prompt=system)
+            generation_prompt = effective_prompt
+            audit_prompt = effective_prompt
+
+            if previous_exchange:
+                context_payload = {
+                    "previous_user_request": previous_exchange["user"],
+                    "previous_assistant_answer": previous_exchange["assistant"],
+                    "current_user_request": effective_prompt,
+                }
+                generation_prompt = json.dumps(context_payload, ensure_ascii=False)
+                audit_prompt = json.dumps(
+                    {
+                        "previous_user_request": previous_exchange["user"],
+                        "current_user_request": effective_prompt,
+                    },
+                    ensure_ascii=False,
+                )
+                system += (
+                    " The user request may include a JSON object containing the immediately "
+                    "previous exchange. Use it only to resolve references or short follow-ups "
+                    "such as 'continue'. The current_user_request is the request to answer."
+                )
+
+            candidate = self.backend.generate(generation_prompt, system_prompt=system)
             if not isinstance(candidate, str) or not candidate.strip() or len(candidate) > 16000:
                 raise ValueError("Invalid or oversized model response")
             report["output_audit"] = "RUNNING"
-            verdict = self.auditor.review(effective_prompt, candidate)
+            verdict = self.auditor.review(audit_prompt, candidate)
             if verdict.safe and verdict.relevant:
                 report.update(action=decision["action"], final_status="SAFE", allowed=True,
                     response=candidate, output_audit="PASSED", user_message="Answer passed the configured output safety review.")
+
+                if session_id:
+                    self.dialogue_context[session_id] = {
+                        "user": prompt,
+                        "assistant": candidate,
+                    }
+                    self.dialogue_context.move_to_end(session_id)
+                    while len(self.dialogue_context) > 100:
+                        self.dialogue_context.popitem(last=False)
+
                 return
             report["output_audit"] = "FAILED"
         report.update(action="BLOCK", final_status="UNSAFE", allowed=False,

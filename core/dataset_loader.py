@@ -354,3 +354,4 @@ class DatasetLoader:
         if self._index is not None:
             return self._index.d
         return 0 if self._embeddings is None else int(self._embeddings.shape[1])
+

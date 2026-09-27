@@ -40,6 +40,9 @@ from core.risk_estimator import (  # noqa: F401
     SEMANTIC_RISK_THRESHOLD,
     EDUCATIONAL_SEMANTIC_BLOCK_THRESHOLD,
     EDUCATIONAL_SEMANTIC_RISK_THRESHOLD,
+    SELF_HARM_INTENTS,
+    HARM_INTENTS,
+    estimate_risk,
 )
 
 # Conversation history signal (decision-engine-specific).
@@ -56,39 +59,19 @@ UNSAFE_DATASET_LABELS = {
     "harmful_instructions",
     "manipulation",
     "self_harm_risk",
-    "harm",
-    "toxicity",
 }
 
 UNSAFE_INTENTS = {
-    "unsafe",
-    "harmful",
-    "harmful_instructions",
-    "cyber_abuse",
-    "cyberattack_intent",
-    "illegal",
     "prompt_injection",
     "jailbreak",
-    "jailbreak_attempt",
-    "self_harm",
-    "self_harm_risk",
-    "hate_speech_harassment",
-}
-
-HIGH_RISK_INTENTS = {
-    "harmful",
     "harmful_instructions",
-    "cyber_abuse",
-    "illegal",
-    "prompt_injection",
-    "jailbreak",
     "manipulation",
-}
-
-CRITICAL_INTENTS = {
-    "self_harm",
     "self_harm_risk",
 }
+
+HIGH_RISK_INTENTS = set(HARM_INTENTS)
+CRITICAL_INTENTS = set(SELF_HARM_INTENTS)
+
 
 
 # ============================================================
@@ -223,7 +206,7 @@ class DecisionEngine:
         )
 
         # Educational / Conceptual intent check
-        is_educational = intent in {"educational", "coding", "benign", "account_recovery"}
+        is_educational = intent == "safe"
 
         # Dynamic Threshold Selection based on Intent Context
         required_block_threshold = (
@@ -449,16 +432,7 @@ class DecisionEngine:
             return "SANITIZE", "CAUTION"
 
         if final_risk == "low":
-            unsafe_intents = {
-                "harmful",
-                "harmful_instructions",
-                "cyber_abuse",
-                "illegal",
-                "prompt_injection",
-                "jailbreak",
-                "self_harm",
-                "self_harm_risk",
-            }
+            unsafe_intents = UNSAFE_INTENTS
             if intent in unsafe_intents:
                 return "SANITIZE", "CAUTION"
 
@@ -478,13 +452,7 @@ class DecisionEngine:
         if not text:
             return None
 
-        if final_risk == "critical" or intent in {
-            "self_harm",
-            "self_harm_risk",
-            "harmful",
-            "illegal",
-            "cyber_abuse",
-        }:
+        if final_risk == "critical" or intent == "self_harm_risk":
             return (
                 "I cannot help with that request. "
                 "If you are in crisis, please contact local emergency "
@@ -507,23 +475,16 @@ class DecisionEngine:
         history_triggered: bool,
         should_block: bool,
     ) -> str:
-        if intent in CRITICAL_INTENTS and intent_confidence >= SELF_HARM_CONFIDENCE:
-            return "critical" if intent_confidence >= SELF_HARM_CRITICAL_CONFIDENCE else "high"
-
-        if should_block:
-            if intent in HIGH_RISK_INTENTS or similarity >= 0.85 or history_triggered:
-                return "high"
-            return "medium"
-
-        is_educational = intent in {"educational", "coding", "benign", "account_recovery"}
-        med_thresh = EDUCATIONAL_SEMANTIC_RISK_THRESHOLD if is_educational else SEMANTIC_RISK_THRESHOLD
-
-        if similarity >= med_thresh:
-            return "medium"
-        if not is_educational and similarity >= 0.55:
-            return "low"
-
-        return "safe"
+        """Use the canonical risk estimator; preserve an explicit history block as high risk."""
+        risk = estimate_risk(
+            intent=intent,
+            intent_confidence=intent_confidence,
+            similarity=similarity,
+            matched_record_intent=None,
+        )
+        if history_triggered and should_block and risk not in {"critical", "high"}:
+            return "high"
+        return risk
 
     # ========================================================
     # BLOCK MESSAGE
@@ -541,19 +502,13 @@ class DecisionEngine:
                 "or restricted content."
             )
 
-        if intent in {"self_harm", "self_harm_risk"}:
+        if intent == "self_harm_risk":
             return "I can't assist with instructions or content that could facilitate self-harm."
 
         if intent in {"prompt_injection", "jailbreak"}:
             return "I can't follow instructions intended to bypass or override safety controls."
 
-        if intent == "cyber_abuse":
-            return "I can't assist with harmful or unauthorized cyber activity."
-
-        if intent == "illegal":
-            return "I can't provide instructions that facilitate illegal activity."
-
-        if intent in {"harmful", "harmful_instructions"}:
+        if intent == "harmful_instructions":
             return "I can't provide instructions that could facilitate harmful activity."
 
         if intent == "manipulation":

@@ -27,7 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MCP_SERVER_DIR = PROJECT_ROOT / "mcp_server"
 AGENT_DIR = PROJECT_ROOT / "agent"
 
-PYTHON_EXE = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+PYTHON_EXE = Path(sys.executable)
 
 os.environ.setdefault("GUARDGPT_PROJECT_ROOT", str(PROJECT_ROOT))
 os.environ.setdefault("OLLAMA_URL", "http://127.0.0.1:11434")
@@ -289,3 +289,5 @@ if __name__ == "__main__":
             raise SystemExit(1)
     finally:
         server.stop()
+
+
