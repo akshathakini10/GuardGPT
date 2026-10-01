@@ -40,7 +40,7 @@ EDUCATIONAL_SEMANTIC_RISK_THRESHOLD = 0.80
 LOW_SIMILARITY_THRESHOLD = 0.40
 
 # Self-harm critical-vs-high boundary (calibrated against the legacy engine).
-SELF_HARM_CRITICAL_CONFIDENCE = 0.50
+SELF_HARM_CRITICAL_CONFIDENCE = 0.85
 
 
 # ============================================================
@@ -121,6 +121,8 @@ def should_preliminarily_block(result_or_mapping: Any) -> bool:
     """
     Cheap first-pass block check used by the legacy GuardEngine.
     """
+    if _get_value(result_or_mapping, "self_harm_signal", None):
+        return True
     intent = _get_value(result_or_mapping, "intent", "unknown") or "unknown"
     intent = str(intent).lower()
     confidence = float(

@@ -99,6 +99,15 @@ def main():
                     continue
                 report = request(prompt, session_id, args.check)
                 print("GuardGPT:", report.get("response") or report.get("user_message"))
+                print(f"Prompt: {prompt}")
+                print(f"Action: {report.get('action', 'unknown')}")
+                print(f"Confidence: {float(report.get('intent_confidence') or 0.0):.4f}")
+                print(f"Intent: {report.get('intent', 'unknown')}")
+                print(f"Intent Engine: {report.get('intent_engine', 'Temporal Intent Engine')}")
+                print(f"Risk: {report.get('risk_level', 'unknown')}")
+                print(f"Audit: {report.get('output_audit', 'NOT_RUN')}")
+                print(f"Session: {report.get('session_id') or session_id}")
+                print(f"Log: {report.get('log_file', 'logs/guardgpt_complete.jsonl')}")
                 print(f"[{report['action']} | {report['final_status']} | audit: {report['output_audit']}]")
         return 0
     except KeyboardInterrupt:

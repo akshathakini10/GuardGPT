@@ -4,6 +4,7 @@ from functools import lru_cache
 from core.decision_engine import DecisionEngine
 from core.risk_estimator import estimate_risk, should_preliminarily_block
 from core.risk_vector import build_risk_vector
+from core.self_harm_signal import self_harm_evidence
 
 
 @lru_cache(maxsize=1)
@@ -29,6 +30,7 @@ class SafetyService:
         intent = str(classified.get("intent", "unknown"))
         confidence = float(classified.get("confidence", 0.0))
         current_intent_vector = dict(classified.get("scores", {}))  # c_t
+        self_harm_signal = self_harm_evidence(prompt, current_intent_vector)
         record = loader.query(prompt)
         if not record:
             raise ValueError("Semantic search returned no record")
@@ -51,7 +53,8 @@ class SafetyService:
             matched_record_id=record.get("request_id"), matched_record_intent=matched_intent,
             category_scores=scores, reason_codes=[],
             current_intent_vector=current_intent_vector,
-            risk_vector=risk_vector)
+            risk_vector=risk_vector, self_harm_signal=self_harm_signal,
+            self_harm_model_score=float(current_intent_vector.get("self_harm_risk", 0.0)))
         preliminary = should_preliminarily_block(signal)
         if patterns:
             preliminary = True

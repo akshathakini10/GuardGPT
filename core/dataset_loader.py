@@ -25,7 +25,7 @@ DATASET_PATH = Path(
             if _JSONL_DATASET.is_file()
             else _ROOT_JSONL_DATASET
             if _ROOT_JSONL_DATASET.is_file()
-            else PROJECT_ROOT / "data" / "guardgpt_augmented_clean.json"
+            else PROJECT_ROOT / "data" / "guardgpt_dataset.json"
         ),
     )
 )

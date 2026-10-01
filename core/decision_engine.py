@@ -192,6 +192,8 @@ class DecisionEngine:
             and intent_confidence >= HIGH_RISK_INTENT_CONFIDENCE
         )
 
+        self_harm_signal = self._get_value(result, "self_harm_signal", None)
+
         critical_intent = (
             intent in CRITICAL_INTENTS
             and intent_confidence >= SELF_HARM_CONFIDENCE
@@ -236,6 +238,12 @@ class DecisionEngine:
             should_block = True
             if preliminary_reason:
                 technical_reasons.append(preliminary_reason)
+
+        # Explicit current-turn self-harm evidence must survive temporal reclassification.
+        if self_harm_signal:
+            should_block = True
+            reason_codes.append("self_harm_" + str(self_harm_signal))
+            technical_reasons.append("Explicit current-turn self-harm safety signal.")
 
         # Rule 2: Critical intent
         if critical_intent:
@@ -302,6 +310,9 @@ class DecisionEngine:
             should_block=should_block,
         )
 
+        if self_harm_signal:
+            final_risk = "critical" if self_harm_signal == "method" else "high"
+
         # ====================================================
         # ALLOW / BLOCK
         # ====================================================
@@ -316,6 +327,8 @@ class DecisionEngine:
                 intent="unknown" if intent in CRITICAL_INTENTS and not critical_intent else intent,
                 history_triggered=history_triggered,
             )
+            if self_harm_signal:
+                user_message = "Self-harm safety support required."
             technical_reason = (
                 "; ".join(technical_reasons)
                 if technical_reasons
